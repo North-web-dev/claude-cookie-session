@@ -83,19 +83,19 @@ def pkce():
     return v, c
 
 
-def authorize(session, org_uuid):
+def _authorize_once(session, org_uuid, scope):
     v, c = pkce()
     state = secrets.token_urlsafe(32)
     body = {"response_type": "code", "client_id": CLIENT_ID, "code_challenge": c,
             "code_challenge_method": "S256", "organization_uuid": org_uuid,
-            "redirect_uri": REDIRECT, "scope": SCOPES, "state": state}
+            "redirect_uri": REDIRECT, "scope": scope, "state": state}
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "Origin": "https://claude.ai", "Referer": "https://claude.ai/oauth/authorize"}
     r = session.post(f"https://claude.ai/v1/oauth/{org_uuid}/authorize",
                      json=body, headers=headers, timeout=15, allow_redirects=False)
     loc = r.headers.get("Location") or ""
     if "code=" in loc:
-        return v, parse_qs(urlparse(loc).query).get("code", [None])[0], state
+        return v, parse_qs(urlparse(loc).query).get("code", [None])[0], state, ""
     if r.headers.get("content-type", "").startswith("application/json"):
         d = r.json()
         code = d.get("code") or d.get("authorization_code")
@@ -104,8 +104,25 @@ def authorize(session, org_uuid):
             if "code=" in redir:
                 code = parse_qs(urlparse(redir).query).get("code", [None])[0]
         if code:
+            return v, code, state, ""
+    return None, None, None, f"{r.status_code}: {r.text[:200]}"
+
+
+def authorize(session, org_uuid):
+    # The elevated `org:create_api_key` scope needs a freshly-authenticated
+    # session; a valid-but-stale cookie fails it with `session_stale_relogin`.
+    # Claude Code never needs that scope, so fall back to the Code-only scopes.
+    err = ""
+    for scope in (SCOPES, " ".join(CC_SCOPES)):
+        v, code, state, err = _authorize_once(session, org_uuid, scope)
+        if v is not None:
             return v, code, state
-    raise SystemExit(f"authorize failed: {r.status_code}: {r.text[:200]}")
+    if "session_stale_relogin" in err or "elevated" in err.lower():
+        raise SystemExit(
+            "session not fresh enough even for Code-only scopes.\n"
+            "Re-login the account on claude.ai (fresh password/2FA) and grab a new sessionKey.\n"
+            f"server: {err}")
+    raise SystemExit(f"authorize failed: {err}")
 
 
 def exchange(verifier, code, state, proxy=None):
